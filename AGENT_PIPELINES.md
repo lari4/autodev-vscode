@@ -950,3 +950,681 @@ Named Element (Class/Method)
 - Kotlin, Rust, etc.
 
 ---
+## Custom Action Pipeline
+
+**Purpose:** Execute user-defined custom prompts from team workspace with flexible multi-role conversations.
+
+**Executor:** `CustomActionExecutor`
+**Location:** `/src/prompt-manage/custom-action/CustomActionExecutor.ts`
+
+**Total Steps:** 1 LLM call (multi-role)
+**Pattern:** Single + Multi-Role Messages
+
+### Custom Prompt Format
+
+User-defined prompts are stored in `.autodev/` directory with the following format:
+
+```yaml
+---
+name: "Generate API Client"
+interaction: AppendCursorStream
+priority: 1
+type: Default
+---
+```system```
+You are an expert API client developer.
+Generate clean, typed API client code.
+
+```user```
+Create an API client for: ${context.selection}
+Using framework: ${context.language}
+Current file: ${context.filepath}
+```
+
+### Step-by-Step Flow
+
+```
+User Trigger: Quick Action Menu → Custom Action
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ PHASE 1: Prompt Discovery and Loading                       │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│ 1. Scan .autodev/ Directory                                  │
+│    → TeamPromptsBuilder.teamPrompts()                        │
+│    → Find all .vm files                                      │
+│    → Locations:                                              │
+│      - .autodev/prompts/**/*.vm                              │
+│      - .autodev/custom-actions/**/*.vm                       │
+│                                                              │
+│ 2. Parse Custom Prompt                                       │
+│    → CustomActionPrompt.fromContent()                        │
+│    → Extract YAML frontmatter:                               │
+│      - name, interaction, priority, type                     │
+│    → Parse multi-role messages:                              │
+│      ```system``` ... ```user``` ... ```assistant```         │
+│                                                              │
+│ 3. Build Available Actions Menu                              │
+│    → Display in Quick Actions                                │
+│    → Sorted by priority                                      │
+└─────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ PHASE 2: Context Building                                   │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│ CustomActionContextBuilder.fromDocument()                    │
+│                                                              │
+│ Collects Rich Context:                                       │
+│   {                                                          │
+│     // Editor Context                                        │
+│     filepath: "/src/api/users.ts",                           │
+│     language: "typescript",                                  │
+│     selection: "User management API",                        │
+│                                                              │
+│     // Cursor Context                                        │
+│     beforeCursor: "const api = {",                           │
+│     afterCursor: "};\nexport default api;",                  │
+│                                                              │
+│     // Element Context (AST)                                 │
+│     element: {                                               │
+│       name: "UserAPI",                                       │
+│       type: "class",                                         │
+│       range: {...}                                           │
+│     },                                                       │
+│                                                              │
+│     // Toolchain Context                                     │
+│     frameworkContext: "React + TypeScript",                  │
+│     buildTool: "Vite",                                       │
+│     packageManager: "npm"                                    │
+│   }                                                          │
+└─────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ PHASE 3: Template Rendering                                 │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│ For Each Message in prompt.messages:                         │
+│                                                              │
+│ Message 1 (system):                                          │
+│   Template: "You are an expert API client developer..."      │
+│   Rendered: (no variables in this message)                   │
+│   Result: Same text                                          │
+│                                                              │
+│ Message 2 (user):                                            │
+│   Template: "Create client for: ${context.selection}"        │
+│   Rendered with Velocity:                                    │
+│     ${context.selection} → "User management API"             │
+│     ${context.language} → "typescript"                       │
+│     ${context.filepath} → "/src/api/users.ts"                │
+│   Result: "Create an API client for: User management API..." │
+│                                                              │
+│ Output: IChatMessage[]                                       │
+│   [{                                                         │
+│     role: ChatMessageRole.System,                            │
+│     content: "You are an expert..."                          │
+│   }, {                                                       │
+│     role: ChatMessageRole.User,                              │
+│     content: "Create an API client for: User management..."  │
+│   }]                                                         │
+└─────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ PHASE 4: LLM Execution                                       │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│ LanguageModelsService.chat(messages)                         │
+│                                                              │
+│ Multi-role conversation sent to LLM                          │
+│                                                              │
+│ LLM Response:                                                │
+│   ```typescript                                              │
+│   class UserAPIClient {                                      │
+│     async getUsers(): Promise<User[]> {                      │
+│       return fetch('/api/users').then(r => r.json());        │
+│     }                                                        │
+│     async createUser(user: User): Promise<User> {            │
+│       return fetch('/api/users', {                           │
+│         method: 'POST',                                      │
+│         body: JSON.stringify(user)                           │
+│       }).then(r => r.json());                                │
+│     }                                                        │
+│   }                                                          │
+│   ```                                                        │
+└─────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ PHASE 5: Output Routing Based on InteractionType            │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│ Switch (prompt.interaction):                                 │
+│                                                              │
+│   Case ChatPanel:                                            │
+│     → newChatSession(output)                                 │
+│     → Show in chat sidebar                                   │
+│                                                              │
+│   Case AppendCursor:                                         │
+│     → insertText(editor, output)                             │
+│     → Insert at cursor position                              │
+│                                                              │
+│   Case AppendCursorStream:                                   │
+│     → Stream output to cursor                                │
+│     → Real-time insertion                                    │
+│                                                              │
+│   Case OutputFile:                                           │
+│     → new FileGenerateTask(output)                           │
+│     → Parse file path from output                            │
+│     → Create new file                                        │
+│                                                              │
+│   Case ReplaceSelection:                                     │
+│     → updateText(editor, selection, output)                  │
+│     → Replace selected text                                  │
+│                                                              │
+│ Our Example: AppendCursorStream                              │
+│   → Code appears at cursor in real-time                      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Data Flow Diagram
+
+```
+Custom .vm File
+      │
+      ▼
+┌──────────────────────┐
+│ Parse Frontmatter    │
+│ Parse Role Messages  │
+└────────┬─────────────┘
+         │
+         ▼
+┌──────────────────────┐
+│ Build Context        │
+│ - Editor state       │
+│ - AST element        │
+│ - Toolchain          │
+└────────┬─────────────┘
+         │
+         ▼
+┌──────────────────────┐
+│ Render Each Message  │
+│ with Velocity        │
+└────────┬─────────────┘
+         │
+         ▼
+   IChatMessage[]
+         │
+         ▼
+┌──────────────────────┐
+│ LLM Call             │
+└────────┬─────────────┘
+         │
+         ▼
+    Output Text
+         │
+         ▼
+┌──────────────────────────────────┐
+│ Route Based on InteractionType: │
+│ ┌────────┬──────────────────┐   │
+│ │ Chat   │ Cursor │ File   │   │
+│ └────────┴────────┴────────┘   │
+└──────────────────────────────────┘
+```
+
+### Context Variables Available
+
+- `${context.filepath}` - Current file path
+- `${context.language}` - Programming language
+- `${context.selection}` - Selected text
+- `${context.beforeCursor}` - Text before cursor
+- `${context.afterCursor}` - Text after cursor
+- `${context.element}` - Current AST element (class/function)
+- `${context.frameworkContext}` - Detected framework
+- `${context.buildTool}` - Build tool (npm, gradle, etc.)
+
+---
+
+## Refactoring Pipelines
+
+## 5. Rename Suggestion Pipeline
+
+**Purpose:** Suggest better names for variables, functions, classes based on context.
+
+**Executor:** `RenameLookupExecutor`
+**Location:** `/src/action/refactor/rename/RenameLookupExecutor.ts`
+
+**Total Steps:** 1 LLM call
+**Pattern:** Single + Context
+
+### Flow Diagram (ASCII)
+
+```
+User Action: F2 on Symbol
+       │
+       ▼
+┌─────────────────────┐
+│ Extract Context     │
+│ - originName        │
+│ - surrounding code  │
+└──────┬──────────────┘
+       │
+       ▼
+┌─────────────────────┐
+│ Render rename.vm    │
+└──────┬──────────────┘
+       │
+       ▼
+┌─────────────────────┐
+│ LLM suggests name   │
+└──────┬──────────────┘
+       │
+       ▼
+┌─────────────────────┐
+│ postNameFix()       │
+│ - Remove quotes     │
+└──────┬──────────────┘
+       │
+       ▼
+  Better Name
+       │
+       ▼
+┌─────────────────────┐
+│ Show in Rename UI   │
+│ (as placeholder)    │
+└─────────────────────┘
+```
+
+---
+
+## 6. Commit Message Generation Pipeline
+
+**Purpose:** Generate conventional commit messages from git diffs.
+
+**Executor:** `CommitMessageGenAction`
+**Location:** `/src/action/devops/CommitMessageGenAction.ts`
+
+**Flow Diagram (ASCII):**
+
+```
+User Command: Generate Commit
+       │
+       ▼
+┌──────────────────────┐
+│ Get Active Repo      │
+│ Read Git Diff        │
+└──────┬───────────────┘
+       │
+       ▼
+┌──────────────────────┐
+│ Build Context:       │
+│ - diffContent        │
+│ - historyExamples    │
+└──────┬───────────────┘
+       │
+       ▼
+┌──────────────────────┐
+│ Render template:     │
+│ gen-commit-msg.vm    │
+└──────┬───────────────┘
+       │
+       ▼
+┌──────────────────────┐
+│ LLM generates msg:   │
+│ "feat(api): add user │
+│  authentication"     │
+└──────┬───────────────┘
+       │
+       ▼
+┌──────────────────────┐
+│ Set in Git Input Box │
+└──────────────────────┘
+```
+
+---
+
+## 7. LLM Reranker Pipeline
+
+**Purpose:** Rerank search results using LLM relevance judgments.
+
+**Executor:** `LLMReranker`
+**Location:** `/src/code-search/reranker/LlmReranker.ts`
+
+**Total Steps:** N LLM calls (one per chunk)
+**Pattern:** Iterative Parallel
+
+### Flow Diagram (ASCII)
+
+```
+Query + ChunkItem[]
+       │
+       ▼
+┌────────────────────────────────────────────┐
+│ For Each Chunk (in parallel):              │
+│                                            │
+│  ┌────────────────┐  ┌────────────────┐   │
+│  │ Chunk 1        │  │ Chunk 2        │   │
+│  │ ↓              │  │ ↓              │   │
+│  │ Context:       │  │ Context:       │   │
+│  │  - query       │  │  - query       │   │
+│  │  - documentId  │  │  - documentId  │   │
+│  │  - document    │  │  - document    │   │
+│  │ ↓              │  │ ↓              │   │
+│  │ llm-reranker.vm│  │ llm-reranker.vm│   │
+│  │ ↓              │  │ ↓              │   │
+│  │ LLM Call #1    │  │ LLM Call #2    │   │
+│  │ ↓              │  │ ↓              │   │
+│  │ "yes" → 1.0    │  │ "no" → 0.0     │   │
+│  └────────────────┘  └────────────────┘   │
+│           │                   │            │
+│           └─────────┬─────────┘            │
+│                     ▼                      │
+│              scores: [1.0, 0.0, ...]       │
+└────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────┐
+│ Return Scores[]     │
+│ for reranking       │
+└─────────────────────┘
+```
+
+### Key Characteristics
+
+- **Parallel Execution:** All chunks scored simultaneously
+- **Binary Classification:** Yes (1.0) or No (0.0)
+- **Few-Shot Examples:** Prompt includes examples for consistency
+- **Fast Model:** Uses lightweight model for speed
+
+---
+
+## Pipeline Comparison Table
+
+| Pipeline | Type | LLM Calls | Streaming | Avg Time | Prompts | Input | Output |
+|----------|------|-----------|-----------|----------|---------|-------|--------|
+| **HyDE Code** | Sequential | 2 | No | 5-8s | propose.vm, evaluate.vm | Query | Answer + Chunks |
+| **HyDE Keywords** | Sequential | 2 | No | 5-8s | propose.vm, evaluate.vm | Query | Answer + Chunks |
+| **Auto Doc** | Single + Context | 1 | No | 2-4s | auto-doc.vm | Code Element | Documentation |
+| **Auto Test** | Single + Context | 1 | Yes | 5-10s | test-gen.vm | Code Element | Test File |
+| **Auto Method** | Single + Context | 1 | No | 3-5s | auto-method.vm | Signature | Implementation |
+| **Custom Action** | Multi-Role | 1 | Optional | 2-6s | User-defined | Context | Variable |
+| **Rename** | Single | 1 | No | 1-2s | rename.vm | Symbol | Name |
+| **Commit Msg** | Single + Context | 1 | No | 2-3s | gen-commit-msg.vm | Git Diff | Commit Message |
+| **LLM Reranker** | Iterative | N | No | 1-3s | llm-reranker.vm | Query + Chunks | Scores[] |
+
+---
+
+## Common Patterns Summary
+
+### 1. Context Collection Pattern
+
+**Used by:** Almost all pipelines
+
+```
+Action Triggered
+       │
+       ▼
+┌──────────────────────────────────────┐
+│ ToolchainContextManager              │
+│ .collectToolchain()                  │
+│                                      │
+│ Parallel Collection:                 │
+│  ┌─────────────────────────────┐    │
+│  │ Build Tool Provider         │    │
+│  │ → package.json, build.gradle│    │
+│  └─────────────────────────────┘    │
+│  ┌─────────────────────────────┐    │
+│  │ Framework Provider          │    │
+│  │ → React, Spring, etc.       │    │
+│  └─────────────────────────────┘    │
+│  ┌─────────────────────────────┐    │
+│  │ Structure Provider          │    │
+│  │ → Project structure         │    │
+│  └─────────────────────────────┘    │
+│                                      │
+│ Output: ToolchainContextItem[]       │
+└──────────────────────────────────────┘
+       │
+       ▼
+  context.chatContext
+```
+
+### 2. Template Rendering Pattern
+
+**Used by:** All pipelines
+
+```
+ActionType + TemplateContext
+       │
+       ▼
+┌──────────────────────────────────────┐
+│ PromptManager.generateInstruction()  │
+│                                      │
+│ 1. Select Language (en/zh-cn)       │
+│ 2. Load Template (.vm file)         │
+│ 3. Render with Velocity              │
+│    - Variables: ${context.var}       │
+│    - Conditionals: #if/$end          │
+│    - Loops: #foreach/#end            │
+│                                      │
+│ Output: Rendered Prompt String       │
+└──────────────────────────────────────┘
+```
+
+### 3. Streaming Response Pattern
+
+**Used by:** Auto Test, Custom Actions (optional)
+
+```
+LLM Streaming Call
+       │
+       ▼
+┌─────────────────────────────────────┐
+│ LanguageModelsService.chat(         │
+│   messages,                         │
+│   options,                          │
+│   {                                 │
+│     report: (fragment) => {         │
+│       output += fragment.part       │
+│       ┌──────────────────────────┐  │
+│       │ Parse Partial Code       │  │
+│       │ Update UI Immediately    │  │
+│       └──────────────────────────┘  │
+│     }                               │
+│   }                                 │
+│ )                                   │
+└─────────────────────────────────────┘
+       │
+       ▼
+  Real-time Updates
+```
+
+---
+
+## Request Lifecycle Example
+
+**Full lifecycle of "Generate Tests for Calculator Class":**
+
+```
+T+0ms: User right-clicks → "AutoTest for method"
+       │
+T+10ms: AutoTestActionCreator.buildMethodAction()
+       → vscode.CodeAction created
+       │
+T+20ms: CommandsService.generateUnitTest()
+       → Parse AST → NamedElement
+       │
+T+50ms: AutoTestActionExecutor initialized
+       │
+T+100ms: Test Environment Setup
+       → Detect Jest framework
+       → Create tests/Calculator.test.ts path
+       │
+T+200ms: Context Collection (Parallel)
+       ┌─────────────────────┬─────────────────────┐
+       │ Parse AST           │ Find Related Classes│
+       │ 50ms                │ 80ms                │
+       └─────────────────────┴─────────────────────┘
+       ┌─────────────────────┬─────────────────────┐
+       │ Toolchain Context   │ Test Samples        │
+       │ 60ms                │ 10ms                │
+       └─────────────────────┴─────────────────────┘
+       │
+T+300ms: Template Rendering
+       → Load test-gen.vm
+       → Render with Velocity
+       → Full prompt ready
+       │
+T+350ms: Open test file in editor
+       │
+T+400ms: Start LLM Streaming Call
+       │
+T+600ms: First fragment received
+       → "describe('Calculator', () => {"
+       → Update file immediately
+       │
+T+800ms: More fragments...
+       → Tests appearing line by line
+       │
+T+5000ms: Final fragment received
+       → Complete test file
+       │
+T+5050ms: Post-processing
+       → Fix imports
+       → Format code
+       │
+T+5100ms: Validation
+       → File not empty ✓
+       │
+T+5150ms: StatusBar → "Done"
+       │
+User sees complete tests and can edit/run
+```
+
+---
+
+## Performance Characteristics
+
+### Latency Breakdown
+
+**Single LLM Call Pipeline (e.g., Auto Doc):**
+```
+Context Collection: 50-200ms
+Template Rendering: 10-30ms
+LLM Call:          1500-3000ms
+Post-Processing:   20-100ms
+─────────────────────────────────
+Total:             1.6-3.3s
+```
+
+**Sequential Multi-LLM Pipeline (e.g., HyDE):**
+```
+Propose Phase:
+  Rendering:       10-30ms
+  LLM Call #1:     1500-3000ms
+Retrieval:         200-500ms
+Evaluate Phase:
+  Rendering:       10-30ms
+  LLM Call #2:     1500-3000ms
+─────────────────────────────────
+Total:             3.2-6.6s
+```
+
+**Streaming Pipeline (e.g., Auto Test):**
+```
+Setup + Context:   100-300ms
+Template:          10-30ms
+First Fragment:    500-1000ms (TTFB)
+Streaming:         3000-8000ms
+Post-Process:      50-150ms
+─────────────────────────────────
+Total:             3.7-9.5s
+User sees output starting at 600ms-1.3s
+```
+
+### Optimization Strategies
+
+1. **Parallel Context Collection**
+   - Multiple providers execute concurrently
+   - Reduces context gathering from ~500ms to ~200ms
+
+2. **Template Caching**
+   - Templates cached in memory after first load
+   - Subsequent renders: <5ms
+
+3. **Streaming for Long Outputs**
+   - Progressive rendering reduces perceived latency
+   - User sees output 3-5x faster
+
+4. **Retrieval Caching**
+   - Code chunk embeddings cached
+   - Repeat searches: 10x faster
+
+---
+
+## Extension Points
+
+### Adding Custom Pipelines
+
+**1. Create Custom Prompt:**
+```velocity
+.autodev/prompts/my-action.vm:
+---
+name: "My Custom Action"
+interaction: AppendCursorStream
+priority: 1
+---
+```system```
+You are a ${context.language} expert.
+
+```user```
+${context.selection}
+```
+
+**2. Restart Extension** - Prompt auto-discovered
+
+**3. Access via Quick Actions** - Available in menu
+
+### Adding Toolchain Providers
+
+**Interface:**
+```typescript
+interface IToolchainContextProvider {
+  isApplicable(context: ToolchainContext): boolean;
+  collect(context: ToolchainContext): Promise<ToolchainContextItem[]>;
+}
+```
+
+**Example:**
+```typescript
+class MyFrameworkProvider implements IToolchainContextProvider {
+  isApplicable(ctx: ToolchainContext): boolean {
+    return ctx.filename.includes('my-framework');
+  }
+
+  async collect(ctx: ToolchainContext): Promise<ToolchainContextItem[]> {
+    return [{
+      name: "Framework Config",
+      text: "Using MyFramework v2.0"
+    }];
+  }
+}
+```
+
+---
+
+## Conclusion
+
+AutoDev implements a sophisticated multi-pipeline agent architecture that handles diverse developer workflows through:
+
+- **10 Major Pipelines** ranging from simple to complex
+- **3 Core Patterns:** Sequential, Single+Context, Iterative
+- **Rich Context** from toolchain, AST, and code analysis
+- **Flexible Templates** with Velocity rendering
+- **Streaming Support** for real-time feedback
+- **Extensibility** via custom prompts and providers
+
+The combination of these patterns enables AutoDev to provide intelligent, context-aware assistance across the entire development lifecycle.

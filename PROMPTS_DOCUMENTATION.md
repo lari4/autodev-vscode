@@ -198,3 +198,180 @@ Start ${context.underTestClassName} test code with ${context.language} Markdown 
 
 ---
 
+## Practices & Refactoring
+
+This category includes prompts for code review, refactoring, commit message generation, renaming, and shell command suggestions.
+
+### 4. Commit Message Generation (gen-commit-msg.vm)
+
+**Purpose:** Generates concise, clear commit messages following the Conventional Commits specification. Analyzes git diffs and creates structured commit messages with proper scope and type.
+
+**Location:** `/prompts/genius/en/practises/gen-commit-msg.vm`
+
+**Context Variables:**
+- `${context.diffContent}` - The git diff to analyze
+- `${context.historyExamples}` - User's historical commit message patterns
+
+**Usage:** Automatically generates commit messages when developers stage changes. The AI analyzes the diff content and creates a commit message that follows best practices and the user's historical style.
+
+**Prompt Template:**
+
+```velocity
+Given the below code differences (diffs), please generate a concise, clear, and straight-to-the-point commit message.
+
+- Make sure to prioritize the main action.
+- Avoid overly verbose descriptions or unnecessary details.
+- Start with a short sentence in imperative form, no more than 50 characters long.
+- Then leave an empty line and continue with a more detailed explanation, if necessary.
+
+Follow the Conventional Commits specification, examples:
+
+- fix(authentication): fix password regex pattern case
+- feat(storage): add support for S3 storage
+- test(java): fix test case for user controller
+- docs(architecture): add architecture diagram to home page
+
+#if( $context.historyExamples.length > 0 )
+Here are the user's historical commit habits:
+$context.historyExamples
+#end
+
+Diff:
+
+```diff
+${context.diffContent}
+```
+```
+
+---
+
+### 5. Code Review (code-review.vm)
+
+**Purpose:** Provides comprehensive code review feedback focusing on algorithms, logic flow, design decisions, and potential issues. Acts as a senior developer reviewing code changes.
+
+**Location:** `/prompts/genius/en/practises/code-review.vm`
+
+**Context Variables:**
+- `${context.frameworkContext}` - Information about frameworks being used
+- `${context.stories}` - Related user stories or requirements
+- `${context.diffContext}` - The code diff to review
+
+**Usage:** Triggered when developers request code review. Provides critical analysis of code changes, identifies risks, and ensures consistency with existing codebase.
+
+**Prompt Template:**
+
+```velocity
+You are a seasoned software developer, and I'm seeking your expertise to review the following code:
+
+- Focus on critical algorithms, logical flow, and design decisions within the code. Discuss how these changes impact the core functionality and the overall structure of the code.
+- Identify and highlight any potential issues or risks introduced by these code changes. This will help reviewers pay special attention to areas that may require improvement or further analysis.
+- Emphasize the importance of compatibility and consistency with the existing codebase. Ensure that the code adheres to the established standards and practices for code uniformity and long-term maintainability.
+
+${context.frameworkContext}
+
+#if($context.stories.isNotEmpty())
+The following user stories are related to these changes:
+${context.stories.joinToString("\n")}
+#end
+
+${context.diffContext}
+
+As your Tech lead, I am only concerned with key code review issues. Please provide me with a critical summary.
+Submit your key insights under 5 sentences in here:
+```
+
+---
+
+### 6. Refactoring Suggestions (refactoring.vm)
+
+**Purpose:** Suggests appropriate refactorings to improve code readability, quality, and organization. Uses well-known refactoring patterns from industry best practices.
+
+**Location:** `/prompts/genius/en/practises/refactoring.vm`
+
+**Context Variables:**
+- Code snippet passed in context (not explicitly named variable in template)
+
+**Usage:** When developers select code and request refactoring suggestions, this prompt analyzes the code and suggests specific, actionable refactorings with a single consolidated code snippet.
+
+**Prompt Template:**
+
+```velocity
+You should suggest appropriate refactorings for the code. Improve code readability, code quality, make the code more organized and understandable.
+Answer should contain refactoring description and ONE code snippet with resulting refactoring.
+Use well-known refactorings, such as one from this list:
+- Renaming
+- Change signature, declaration
+- Extract or Introduce variable, function, constant, parameter, type parameter
+- Extract class, interface, superclass
+- Inline class, function, variable, etc
+- Move field, function, statements, etc
+- Pull up constructor, field, method
+- Push down field, method.
+Do not generate more than one code snippet, try to incorporate all changes in one code snippet.
+Do not generate mock surrounding classes, methods. Do not mock missing dependencies.
+Provided code is incorporated into correct and compilable code, don't surround it with additional classes.
+Refactor the following code:
+```
+
+---
+
+### 7. Rename Suggestions (rename.vm)
+
+**Purpose:** Suggests better, more descriptive names for variables, functions, classes, or other code elements based on their usage and context.
+
+**Location:** `/prompts/genius/en/practises/rename.vm`
+
+**Context Variables:**
+- `${context.originName}` - The current name to be replaced
+- `${context.language}` - Programming language
+- `${context.code}` - Code context where the name is used
+
+**Usage:** Helps developers find more meaningful names for code elements. Returns a single better name suggestion.
+
+**Prompt Template:**
+
+```velocity
+${context.originName} is a badname. Please provide 1 better options name for follow code:
+```${context.language}
+${context.code}
+```
+
+just return the better name:
+```
+
+---
+
+### 8. Shell Command Suggestions (shell-suggest.vm)
+
+**Purpose:** Converts natural language descriptions into shell commands. Returns only the raw command string ready for execution.
+
+**Location:** `/prompts/genius/en/practises/shell-suggest.vm`
+
+**Context Variables:**
+- `${context.today}` - Current date
+- `${context.os}` - User's operating system
+- `${context.cwd}` - Current working directory
+- `${context.shellPath}` - User's shell (bash, zsh, etc.)
+- `${context.question}` - User's natural language request
+
+**Usage:** Translates user requests like "undo last git commit" into executable shell commands. Output is designed to be passed directly to subprocess execution.
+
+**Prompt Template:**
+
+```velocity
+Return only the command to be executed as a raw string, no string delimiters
+wrapping it, no yapping, no markdown, no fenced code blocks, what you return
+will be passed to subprocess.check_output() directly.
+
+- Today is: ${context.today}, user system is: ${context.os},
+- User current directory is: ${context.cwd}, user use is: ${context.shellPath}, according the tool to create the command.
+
+For example, if the user asks: undo last git commit
+
+You return only line command: git reset --soft HEAD~1
+
+User asks: ${context.question}
+```
+
+---
+

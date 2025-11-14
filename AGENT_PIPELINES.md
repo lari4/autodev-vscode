@@ -1,0 +1,1630 @@
+# AutoDev Agent Pipelines Documentation
+
+This document provides comprehensive documentation of all agent pipelines and workflows in the AutoDev VSCode extension. It describes how prompts are chained together, what data flows between them, and how the AI agent processes different types of user requests.
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Pipeline Patterns](#pipeline-patterns)
+- [Search Pipelines](#search-pipelines)
+  - [HyDE Code Search Pipeline](#1-hyde-code-search-pipeline)
+  - [HyDE Keywords Search Pipeline](#2-hyde-keywords-search-pipeline)
+- [Code Generation Pipelines](#code-generation-pipelines)
+- [Refactoring Pipelines](#refactoring-pipelines)
+- [Custom Action Pipeline](#custom-action-pipeline)
+- [Common Patterns](#common-patterns)
+- [Data Flow Diagrams](#data-flow-diagrams)
+
+## Overview
+
+AutoDev uses multiple AI agent pipelines to handle different types of developer tasks. These pipelines range from simple single-LLM calls to complex multi-step workflows involving multiple AI invocations, code retrieval, and context augmentation.
+
+**Key Statistics:**
+- **Total Pipelines:** 10 major pipelines
+- **Pipeline Types:** Sequential, Single + Context, Iterative
+- **Average Steps:** 1-3 LLM calls per pipeline
+- **Streaming Support:** Yes (for test generation and chat)
+
+## Architecture
+
+### Core Components
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    AutoDev Extension                         │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  ┌────────────────┐      ┌─────────────────┐               │
+│  │ User Interface │──────│  Command Service│               │
+│  └────────────────┘      └─────────────────┘               │
+│          │                        │                         │
+│          ▼                        ▼                         │
+│  ┌────────────────┐      ┌─────────────────┐               │
+│  │ Chat Interface │      │ Action Executors│               │
+│  │   (Catalyser)  │      │  (AutoDoc, etc) │               │
+│  └────────────────┘      └─────────────────┘               │
+│          │                        │                         │
+│          └────────┬───────────────┘                         │
+│                   ▼                                          │
+│          ┌─────────────────┐                                │
+│          │ Prompt Manager  │                                │
+│          │ - Template Load │                                │
+│          │ - Context Build │                                │
+│          │ - Rendering     │                                │
+│          └─────────────────┘                                │
+│                   │                                          │
+│                   ▼                                          │
+│          ┌─────────────────┐                                │
+│          │ Language Models │                                │
+│          │    Service      │                                │
+│          │  (LLM Gateway)  │                                │
+│          └─────────────────┘                                │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Pipeline Execution Flow
+
+```
+User Action/Command
+       │
+       ▼
+┌──────────────┐
+│Context       │ ← Collect document, selection, AST
+│Collection    │
+└──────────────┘
+       │
+       ▼
+┌──────────────┐
+│Toolchain     │ ← Build configs, frameworks, conventions
+│Context       │
+└──────────────┘
+       │
+       ▼
+┌──────────────┐
+│Template      │ ← Load .vm file, render with Velocity
+│Rendering     │
+└──────────────┘
+       │
+       ▼
+┌──────────────┐
+│LLM           │ ← Call AI model (streaming or single)
+│Execution     │
+└──────────────┘
+       │
+       ▼
+┌──────────────┐
+│Post-         │ ← Parse, format, validate
+│Processing    │
+└──────────────┘
+       │
+       ▼
+┌──────────────┐
+│UI Update     │ ← Insert code, show results
+└──────────────┘
+```
+
+## Pipeline Patterns
+
+AutoDev implements three main pipeline patterns:
+
+### 1. Sequential Multi-LLM Pattern
+
+**Characteristics:**
+- Multiple LLM calls in sequence
+- Output of one step becomes input to next
+- Used for complex reasoning tasks
+
+**Example:** HyDE Search (Propose → Retrieve → Evaluate)
+
+### 2. Single + Context Augmentation Pattern
+
+**Characteristics:**
+- Single LLM call with enriched context
+- Extensive pre-processing to gather context
+- Most common pattern in AutoDev
+
+**Example:** Auto Documentation, Auto Test
+
+### 3. Iterative Pattern
+
+**Characteristics:**
+- Same LLM call repeated for multiple items
+- Parallel or sequential execution
+- Aggregates results
+
+**Example:** LLM Reranking
+
+---
+
+## Search Pipelines
+
+These pipelines implement semantic code search using the HyDE (Hypothetical Document Embeddings) technique.
+
+## 1. HyDE Code Search Pipeline
+
+**Purpose:** Semantic code search by generating hypothetical code that matches the query, then finding similar real code.
+
+**Executor:** `HydeCodeStrategy`
+**Location:** `/src/code-search/search-strategy/HydeCodeStrategy.ts`
+
+**Total Steps:** 3 (2 LLM calls + 1 retrieval)
+**Pattern:** Sequential Multi-LLM
+
+### Step-by-Step Flow
+
+```
+User Query: "How do we handle authentication?"
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 1: PROPOSE - Generate Hypothetical Code                │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│ Prompt Template: /prompts/genius/en/hyde/code/propose.vm    │
+│                                                              │
+│ Input Context:                                               │
+│   {                                                          │
+│     question: "How do we handle authentication?",            │
+│     chatContext: "<current file context>"                    │
+│   }                                                          │
+│                                                              │
+│ LLM generates hypothetical code (5-10 lines):                │
+│   ```javascript                                              │
+│   const auth = require('./auth');                            │
+│   app.use(auth.middleware);                                  │
+│   app.post('/login', auth.verify);                           │
+│   ```                                                        │
+│                                                              │
+│ Output: HydeDocument { content: "...", language: "js" }      │
+└─────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 2: RETRIEVE - Find Similar Code                        │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│ Retrieval Strategies (parallel):                            │
+│                                                              │
+│ ┌──────────────────┐  ┌──────────────────┐                 │
+│ │ Full-Text Search │  │ Semantic Search  │                 │
+│ │  (FTS Engine)    │  │ (Vector DB)      │                 │
+│ └──────────────────┘  └──────────────────┘                 │
+│         │                      │                            │
+│         └──────────┬───────────┘                            │
+│                    ▼                                         │
+│         ┌──────────────────┐                                │
+│         │ Deduplication    │                                │
+│         │ & Ranking        │                                │
+│         └──────────────────┘                                │
+│                    │                                         │
+│ Retrieved Chunks:                                            │
+│   - /src/auth/middleware.ts (lines 10-30)                   │
+│   - /src/auth/verify.ts (lines 5-25)                        │
+│   - /config/auth.config.ts (lines 1-15)                     │
+│                                                              │
+│ Output: ChunkItem[] (max 10 chunks)                         │
+└─────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 3: EVALUATE - Answer Query with Retrieved Code         │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│ Prompt Template: /prompts/genius/en/hyde/code/evaluate.vm   │
+│                                                              │
+│ Input Context:                                               │
+│   {                                                          │
+│     question: "How do we handle authentication?",            │
+│     language: "typescript",                                  │
+│     code: "<concatenated chunks>",                           │
+│     chatContext: "<formatting rules>"                        │
+│   }                                                          │
+│                                                              │
+│ LLM analyzes and synthesizes answer:                         │
+│   "Authentication is handled through middleware in           │
+│    /src/auth/middleware.ts. The verify() function validates  │
+│    tokens using JWT. Here's the key code:                    │
+│    [code snippet from chunks]"                               │
+│                                                              │
+│ Output: Final answer with code references                    │
+└─────────────────────────────────────────────────────────────┘
+       │
+       ▼
+   Display to User
+```
+
+### Data Flow Diagram
+
+```
+┌──────────────┐
+│ User Query   │
+└──────┬───────┘
+       │
+       ▼
+┌──────────────────────────────────────────────────────┐
+│  Context: { question, chatContext }                  │
+└──────┬───────────────────────────────────────────────┘
+       │
+       ▼
+┌──────────────────────────────────────────────────────┐
+│  Prompt 1: propose.vm                                │
+│  → LLM Call #1                                       │
+│  → Output: Hypothetical Code String                  │
+└──────┬───────────────────────────────────────────────┘
+       │
+       ▼
+┌──────────────────────────────────────────────────────┐
+│  Retrieval: DefaultRetrieval.retrieve()              │
+│  → Input: hypothetical code                          │
+│  → FTS Search                                        │
+│  → Vector Search                                     │
+│  → Output: ChunkItem[]                               │
+└──────┬───────────────────────────────────────────────┘
+       │
+       ▼
+┌──────────────────────────────────────────────────────┐
+│  Context: { question, code: chunks, chatContext }    │
+└──────┬───────────────────────────────────────────────┘
+       │
+       ▼
+┌──────────────────────────────────────────────────────┐
+│  Prompt 2: evaluate.vm                               │
+│  → LLM Call #2                                       │
+│  → Output: Final Answer                              │
+└──────┬───────────────────────────────────────────────┘
+       │
+       ▼
+┌──────────────┐
+│ Show Answer  │
+└──────────────┘
+```
+
+### Context Variables
+
+**Propose Phase:**
+- `${context.question}` - User's search query
+
+**Evaluate Phase:**
+- `${context.question}` - Original query
+- `${context.language}` - Programming language
+- `${context.code}` - Retrieved code chunks (concatenated)
+- `${context.chatContext}` - Formatting rules and guidelines
+
+### Prompts Used
+
+1. **propose.vm** - Generates hypothetical code snippet
+   - Role: Creative code synthesis
+   - Output: 5-10 lines of code
+
+2. **evaluate.vm** - Analyzes retrieved code and answers query
+   - Role: Code comprehension and summarization
+   - Output: Natural language answer with code references
+
+### Key Implementation Details
+
+**File:** `/src/code-search/search-strategy/HydeCodeStrategy.ts:31-70`
+
+```typescript
+async search(query: string, context: SearchContext): Promise<StrategyFinalPrompt> {
+  // Step 1: Propose
+  const instruction = await renderHydeTemplate(
+    HydeStep.Propose,
+    SystemActionType.SemanticSearchCode,
+    { question: query, chatContext: context.currentDoc }
+  );
+  const hydeDoc = await executeIns(this.ext, instruction);
+
+  // Step 2: Retrieve
+  const chunks = await retrieveChunks(
+    hydeDoc.content,
+    this.retrievalSettings
+  );
+
+  // Step 3: Evaluate
+  const evalInstruction = await renderHydeTemplate(
+    HydeStep.Evaluate,
+    SystemActionType.SemanticSearchCode,
+    {
+      question: query,
+      code: chunks.map(c => c.text).join('\n'),
+      language: context.language,
+      chatContext: context.currentDoc
+    }
+  );
+
+  return new StrategyFinalPrompt(evalInstruction, chunks);
+}
+```
+
+### Performance Characteristics
+
+- **Latency:** 4-8 seconds (2 LLM calls + retrieval)
+- **Accuracy:** High (better than keyword search)
+- **Cost:** 2x LLM calls compared to single-shot search
+- **Cache:** Retrieval results can be cached
+
+### Use Cases
+
+- "Where is the authentication logic?"
+- "How do we connect to the database?"
+- "Show me error handling code"
+- "Find the API endpoint for user creation"
+
+---
+
+## 2. HyDE Keywords Search Pipeline
+
+**Purpose:** Semantic code search by extracting and expanding keywords from natural language queries.
+
+**Executor:** `HydeKeywordsStrategy`
+**Location:** `/src/code-search/search-strategy/HydeKeywordsStrategy.ts`
+
+**Total Steps:** 3 (2 LLM calls + 1 retrieval)
+**Pattern:** Sequential Multi-LLM
+
+### Step-by-Step Flow
+
+```
+User Query: "Where is the code for calculating averages?"
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 1: PROPOSE - Extract and Expand Keywords               │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│ Prompt Template: /prompts/genius/en/hyde/keywords/propose.vm│
+│                                                              │
+│ Input Context:                                               │
+│   {                                                          │
+│     question: "Where is the code for calculating averages?" │
+│   }                                                          │
+│                                                              │
+│ LLM processes query step-by-step:                            │
+│   1. Resolves pronouns and ambiguous terms                   │
+│   2. Generates precise question                              │
+│   3. Extracts up to 8 relevant keywords                      │
+│   4. Provides variations for each keyword                    │
+│                                                              │
+│ Output:                                                      │
+│   Precise Question:                                          │
+│     "Where is calculating the average of a list?"            │
+│                                                              │
+│   Keywords:                                                  │
+│   - basic: ["calculate average", "average", ...]             │
+│   - single: ["calculate", "average", "computation"]          │
+│   - localization: ["jisuan", "pingjun"]                      │
+│                                                              │
+│ Output: HydeKeywords object                                  │
+└─────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 2: RETRIEVE - Search Using Keywords                    │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│ Combined Query Construction:                                 │
+│   keywords.basic[0] +                                        │
+│   keywords.single[0] +                                       │
+│   keywords.localization[0]                                   │
+│                                                              │
+│ Example: "calculate average calculate jisuan"                │
+│                                                              │
+│ Retrieval Strategies (parallel):                            │
+│   - Full-Text Search                                        │
+│   - Semantic/Vector Search                                  │
+│   - Git Commit Message Search (if needed)                   │
+│                                                              │
+│ Retrieved Chunks:                                            │
+│   - /src/math/statistics.ts (lines 45-65)                   │
+│   - /utils/array-helpers.ts (lines 12-28)                   │
+│   - /lib/calculator.ts (lines 89-105)                       │
+│                                                              │
+│ Output: ChunkItem[]                                          │
+└─────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 3: EVALUATE - Answer with Retrieved Code               │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│ Prompt Template: /prompts/genius/en/hyde/keywords/evaluate.vm│
+│                                                              │
+│ Input Context:                                               │
+│   {                                                          │
+│     question: "Where is calculating averages?",              │
+│     language: "typescript",                                  │
+│     code: "<retrieved chunks>",                              │
+│     chatContext: "<rules>"                                   │
+│   }                                                          │
+│                                                              │
+│ LLM analyzes code and formulates answer                      │
+│                                                              │
+│ Output: Answer with file references                          │
+└─────────────────────────────────────────────────────────────┘
+       │
+       ▼
+   Display to User
+```
+
+### Data Flow Diagram
+
+```
+User Query
+    │
+    ▼
+┌────────────────────────┐
+│ Prompt: propose.vm     │
+│ LLM extracts keywords  │
+└────────┬───────────────┘
+         │
+         ▼
+    HydeKeywords {
+      question: "...",
+      basic: [...],
+      single: [...],
+      localization: [...]
+    }
+         │
+         ▼
+┌────────────────────────┐
+│ Combine keywords       │
+│ Retrieve code chunks   │
+└────────┬───────────────┘
+         │
+         ▼
+    ChunkItem[]
+         │
+         ▼
+┌────────────────────────┐
+│ Prompt: evaluate.vm    │
+│ LLM synthesizes answer │
+└────────┬───────────────┘
+         │
+         ▼
+    Final Answer
+```
+
+### Prompts Used
+
+1. **propose.vm** - Keyword extraction and expansion
+2. **evaluate.vm** - Answer synthesis from retrieved code
+
+---
+
+## Code Generation Pipelines
+
+These pipelines generate various types of code artifacts using context-augmented single LLM calls.
+
+## 3. Auto Documentation Pipeline
+
+**Purpose:** Generate documentation comments for code elements (functions, classes, methods).
+
+**Executor:** `AutoDocActionExecutor`
+**Location:** `/src/action/autodoc/AutoDocActionExecutor.ts`
+
+**Total Steps:** 1 LLM call
+**Pattern:** Single + Context Augmentation
+
+### Step-by-Step Flow
+
+```
+User Action: Right-click on function → "Generate Documentation"
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ PHASE 1: Context Collection                                 │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│ 1. Parse Document AST                                        │
+│    → TreeSitter parser                                       │
+│    → Extract NamedElement (function/class)                   │
+│                                                              │
+│ 2. Extract Code Element                                      │
+│    → element.blockRange (function body)                      │
+│    → element.identifierRange (signature)                     │
+│                                                              │
+│ 3. Get Comment Symbols                                       │
+│    → Language-specific:                                      │
+│      - Java: /** */                                          │
+│      - Python: """ """                                       │
+│      - JavaScript: /** */                                    │
+│                                                              │
+│ 4. Collect Toolchain Context                                 │
+│    → ToolchainContextManager.collectToolchain()              │
+│    → Build tools (package.json, gradle)                      │
+│    → Frameworks detected                                     │
+│    → Coding conventions                                      │
+│                                                              │
+│ 5. Build AutoDocTemplateContext                              │
+│    {                                                         │
+│      language: "typescript",                                 │
+│      startSymbol: "/**",                                     │
+│      endSymbol: "*/",                                        │
+│      code: "<function code>",                                │
+│      originalComments: ["..."],                              │
+│      chatContext: "<toolchain info>",                        │
+│      forbiddenRules: ["no emoji", ...]                       │
+│    }                                                         │
+└─────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ PHASE 2: Template Rendering                                 │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│ PromptManager.generateInstruction(ActionType.AutoDoc, ctx)   │
+│                                                              │
+│ Template: /prompts/genius/en/code/auto-doc.vm                │
+│                                                              │
+│ Velocity rendering:                                          │
+│   #if($context.chatContext.length > 0)                       │
+│     ${context.chatContext}                                   │
+│   #end                                                       │
+│                                                              │
+│ Rendered Prompt:                                             │
+│   "Write documentation for user's given typescript code.     │
+│    Start your documentation with /** and ends with */.       │
+│    Here is User's code:                                      │
+│    ```typescript                                             │
+│    function calculateAverage(numbers: number[]): number {    │
+│      // code...                                              │
+│    }                                                         │
+│    ```"                                                      │
+└─────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ PHASE 3: LLM Execution                                       │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│ LanguageModelsService.chat([{                                │
+│   role: ChatMessageRole.User,                                │
+│   content: renderedPrompt                                    │
+│ }])                                                          │
+│                                                              │
+│ LLM Response:                                                │
+│   ```typescript                                              │
+│   /**                                                        │
+│    * Calculates the arithmetic mean of an array of numbers.  │
+│    * @param numbers - Array of numeric values                │
+│    * @returns The average of all numbers                     │
+│    * @throws Error if array is empty                         │
+│    */                                                        │
+│   ```                                                        │
+└─────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ PHASE 4: Post-Processing                                     │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│ 1. Parse Markdown Code Block                                 │
+│    → StreamingMarkdownCodeBlock.parse()                      │
+│    → Extract content between ``` markers                     │
+│                                                              │
+│ 2. Format Documentation                                      │
+│    → MarkdownTextProcessor.buildDocFromSuggestion()          │
+│    → Add proper indentation                                  │
+│    → Ensure comment symbols match language                   │
+│                                                              │
+│ 3. Insert at Proper Location                                 │
+│    → insertCodeByRange()                                     │
+│    → Position: before function declaration                   │
+│                                                              │
+│ Final Result:                                                │
+│   /**                                                        │
+│    * Calculates the arithmetic mean of an array of numbers.  │
+│    * @param numbers - Array of numeric values                │
+│    * @returns The average of all numbers                     │
+│    * @throws Error if array is empty                         │
+│    */                                                        │
+│   function calculateAverage(numbers: number[]): number {     │
+│     // existing code...                                      │
+│   }                                                          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Data Flow Diagram
+
+```
+Named Element (AST Node)
+         │
+         ▼
+┌──────────────────────┐
+│ Extract code text    │
+│ Get comment symbols  │
+│ Collect toolchain    │
+└────────┬─────────────┘
+         │
+         ▼
+  AutoDocTemplateContext
+         │
+         ▼
+┌──────────────────────┐
+│ Render auto-doc.vm   │
+└────────┬─────────────┘
+         │
+         ▼
+     Prompt String
+         │
+         ▼
+┌──────────────────────┐
+│ LLM Call             │
+└────────┬─────────────┘
+         │
+         ▼
+  Documentation Text
+         │
+         ▼
+┌──────────────────────┐
+│ Parse & Format       │
+│ Insert before func   │
+└──────────────────────┘
+```
+
+### Context Variables
+
+- `${context.language}` - Programming language (e.g., "typescript")
+- `${context.startSymbol}` - Comment start (e.g., "/**")
+- `${context.endSymbol}` - Comment end (e.g., "*/")
+- `${context.code}` - The function/class code
+- `${context.originalComments}` - Existing comments (if any)
+- `${context.chatContext}` - Toolchain context information
+- `${context.forbiddenRules}` - Documentation style rules
+
+---
+
+## 4. Auto Test Generation Pipeline
+
+**Purpose:** Generate comprehensive unit tests for classes and methods.
+
+**Executor:** `AutoTestActionExecutor`
+**Location:** `/src/action/autotest/AutoTestActionExecutor.ts`
+
+**Total Steps:** 1 LLM call (with streaming)
+**Pattern:** Single + Context Augmentation + Streaming
+
+### Step-by-Step Flow
+
+```
+User Action: Right-click on class → "Generate Tests"
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ PHASE 1: Test Environment Setup                             │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│ 1. Detect Test Framework                                     │
+│    → TestGenProviderManager.provide(language)                │
+│    → Returns language-specific provider:                     │
+│      - JavaTestGenProvider (JUnit)                           │
+│      - PythonTestGenProvider (pytest)                        │
+│      - TypeScriptTestGenProvider (Jest)                      │
+│                                                              │
+│ 2. Setup Test File                                           │
+│    → testgen.setupTestFile(document, element)                │
+│    → Determine test file path:                               │
+│      src/Calculator.ts → tests/Calculator.test.ts            │
+│    → Create file if doesn't exist                            │
+│    → Setup imports and boilerplate                           │
+│                                                              │
+│ 3. Build Initial Context                                     │
+│    → targetPath: "tests/Calculator.test.ts"                  │
+│    → targetTestClassName: "CalculatorTest"                   │
+│    → isNewFile: true/false                                   │
+└─────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ PHASE 2: Context Collection (Multi-Source)                  │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│ A. Source Code Analysis                                      │
+│    → TreeSitterFileManager.create(document)                  │
+│    → Parse AST to understand structure                       │
+│    → Extract imports, dependencies                           │
+│                                                              │
+│ B. Related Code Discovery                                    │
+│    → relevantCodeProviderManager.relatedClassesContext()     │
+│    → Find:                                                   │
+│      - Classes that current class depends on                 │
+│      - Interfaces implemented                                │
+│      - Parent classes                                        │
+│    → Example: "Calculator depends on Logger, MathUtils"      │
+│                                                              │
+│ C. Toolchain Context                                         │
+│    → ToolchainContextManager.collectToolchain()              │
+│    → Collect:                                                │
+│      - Test framework configs (jest.config.js)               │
+│      - Build tool settings                                   │
+│      - Project structure                                     │
+│                                                              │
+│ D. Language-Specific Test Context                            │
+│    → testgen.additionalTestContext()                         │
+│    → Provide:                                                │
+│      - Test sample code                                      │
+│      - Assertion patterns                                    │
+│      - Mocking examples                                      │
+│                                                              │
+│ E. Merge All Contexts                                        │
+│    context.chatContext =                                     │
+│      toolchainItems.join('\n') +                             │
+│      testContextItems.join('\n')                             │
+│                                                              │
+│ Final AutoTestTemplateContext:                               │
+│   {                                                          │
+│     language: "typescript",                                  │
+│     filename: "Calculator.ts",                               │
+│     isNewFile: true,                                         │
+│     relatedClasses: "Logger, MathUtils",                     │
+│     currentClass: "class Calculator {...}",                  │
+│     underTestClassName: "Calculator",                        │
+│     targetTestClassName: "CalculatorTest",                   │
+│     targetPath: "tests/Calculator.test.ts",                  │
+│     imports: ["Logger", "MathUtils"],                        │
+│     sourceCode: "class Calculator { add(a,b) {...} }",       │
+│     chatContext: "<all collected context>"                   │
+│   }                                                          │
+└─────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ PHASE 3: Prompt Generation with Conditionals                │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│ PromptManager.generateInstruction(ActionType.AutoTest, ctx)  │
+│                                                              │
+│ Template: /prompts/genius/en/code/test-gen.vm                │
+│                                                              │
+│ Velocity rendering with conditionals:                        │
+│   Write unit test for following typescript code.             │
+│   ${context.chatContext}                                     │
+│   #if( $context.relatedClasses.length > 0 )                  │
+│     Related classes: ${context.relatedClasses}               │
+│   #end                                                       │
+│   #if( $context.currentClass.length > 0 )                    │
+│     Here is current class information:                       │
+│     ${context.currentClass}                                  │
+│   #end                                                       │
+│   Here is the source code to be tested:                      │
+│   ```typescript                                              │
+│   ${context.sourceCode}                                      │
+│   ```                                                        │
+│   #if( $context.isNewFile )                                  │
+│     Start method test code with typescript Markdown block    │
+│   #else                                                      │
+│     Start CalculatorTest test code with typescript block     │
+│   #end                                                       │
+└─────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ PHASE 4: LLM Execution with Streaming                       │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│ 1. Open Test File in Editor                                  │
+│    → window.showTextDocument(testFilePath)                   │
+│    → Navigate before LLM call for real-time updates          │
+│                                                              │
+│ 2. Start Streaming LLM Call                                  │
+│    LanguageModelsService.chat(messages, options, {           │
+│      report: async (fragment) => {                           │
+│        // Called multiple times as response generates         │
+│        output += fragment.part;                              │
+│                                                              │
+│        // Parse partial code                                 │
+│        let parsed = StreamingMarkdownCodeBlock.parse(        │
+│          output,                                             │
+│          context.language                                    │
+│        );                                                    │
+│                                                              │
+│        if (parsed && parsed.text) {                          │
+│          // Update file in real-time!                        │
+│          let edit = new WorkspaceEdit();                     │
+│          edit.replace(testFile, range, parsed.text);         │
+│          workspace.applyEdit(edit);                          │
+│        }                                                     │
+│      }                                                       │
+│    })                                                        │
+│                                                              │
+│ User sees test code appearing line by line                    │
+│                                                              │
+│ Final Generated Tests:                                       │
+│   describe('Calculator', () => {                             │
+│     let calculator: Calculator;                              │
+│                                                              │
+│     beforeEach(() => {                                       │
+│       calculator = new Calculator();                         │
+│     });                                                      │
+│                                                              │
+│     test('should add two numbers correctly', () => {         │
+│       expect(calculator.add(2, 3)).toBe(5);                  │
+│     });                                                      │
+│                                                              │
+│     test('should handle negative numbers', () => {           │
+│       expect(calculator.add(-2, -3)).toBe(-5);               │
+│     });                                                      │
+│   });                                                        │
+└─────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ PHASE 5: Post-Processing & Validation                       │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│ 1. Language-Specific Fixes                                   │
+│    → testgen.postProcessCodeFix(testDoc, output)             │
+│    → Fix imports                                             │
+│    → Add missing assertions                                  │
+│    → Format code                                             │
+│                                                              │
+│ 2. Validation                                                │
+│    if (testDoc.getText().length === 0) {                     │
+│      // Generation failed - delete empty file                │
+│      workspace.fs.delete(testFileUri);                       │
+│      throw new Error("Test generation failed");              │
+│    }                                                         │
+│                                                              │
+│ 3. Final State                                               │
+│    → Test file exists with complete tests                    │
+│    → User can edit and run tests                             │
+│    → StatusBar shows "Done"                                  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Data Flow Diagram
+
+```
+Named Element (Class/Method)
+         │
+         ▼
+┌──────────────────────────────────┐
+│ Setup Test Environment           │
+│ - Detect framework               │
+│ - Create test file path          │
+└────────┬─────────────────────────┘
+         │
+         ▼
+┌──────────────────────────────────┐
+│ Collect Multi-Source Context     │
+│ - Parse AST                      │
+│ - Find related classes           │
+│ - Collect toolchain              │
+│ - Get test samples               │
+└────────┬─────────────────────────┘
+         │
+         ▼
+   AutoTestTemplateContext
+         │
+         ▼
+┌──────────────────────────────────┐
+│ Render test-gen.vm               │
+│ - Conditional sections           │
+└────────┬─────────────────────────┘
+         │
+         ▼
+      Prompt String
+         │
+         ▼
+┌──────────────────────────────────┐
+│ LLM Streaming Call               │
+│ ┌─────────────────────────────┐  │
+│ │ Fragment 1 → Update file    │  │
+│ │ Fragment 2 → Update file    │  │
+│ │ Fragment 3 → Update file    │  │
+│ │ ... (real-time updates)     │  │
+│ └─────────────────────────────┘  │
+└────────┬─────────────────────────┘
+         │
+         ▼
+   Complete Test Code
+         │
+         ▼
+┌──────────────────────────────────┐
+│ Post-Process & Validate          │
+│ - Fix imports                    │
+│ - Format code                    │
+│ - Check not empty                │
+└──────────────────────────────────┘
+```
+
+### Key Features
+
+**Streaming Updates:**
+- User sees tests being generated in real-time
+- Each fragment updates the file immediately
+- Progressive rendering for better UX
+
+**Context Enrichment:**
+- Related classes automatically discovered
+- Test framework detected automatically
+- Sample test patterns included
+
+**Language Support:**
+- Java (JUnit)
+- Python (pytest)
+- TypeScript/JavaScript (Jest)
+- Go (testing package)
+- Kotlin, Rust, etc.
+
+---
+## Custom Action Pipeline
+
+**Purpose:** Execute user-defined custom prompts from team workspace with flexible multi-role conversations.
+
+**Executor:** `CustomActionExecutor`
+**Location:** `/src/prompt-manage/custom-action/CustomActionExecutor.ts`
+
+**Total Steps:** 1 LLM call (multi-role)
+**Pattern:** Single + Multi-Role Messages
+
+### Custom Prompt Format
+
+User-defined prompts are stored in `.autodev/` directory with the following format:
+
+```yaml
+---
+name: "Generate API Client"
+interaction: AppendCursorStream
+priority: 1
+type: Default
+---
+```system```
+You are an expert API client developer.
+Generate clean, typed API client code.
+
+```user```
+Create an API client for: ${context.selection}
+Using framework: ${context.language}
+Current file: ${context.filepath}
+```
+
+### Step-by-Step Flow
+
+```
+User Trigger: Quick Action Menu → Custom Action
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ PHASE 1: Prompt Discovery and Loading                       │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│ 1. Scan .autodev/ Directory                                  │
+│    → TeamPromptsBuilder.teamPrompts()                        │
+│    → Find all .vm files                                      │
+│    → Locations:                                              │
+│      - .autodev/prompts/**/*.vm                              │
+│      - .autodev/custom-actions/**/*.vm                       │
+│                                                              │
+│ 2. Parse Custom Prompt                                       │
+│    → CustomActionPrompt.fromContent()                        │
+│    → Extract YAML frontmatter:                               │
+│      - name, interaction, priority, type                     │
+│    → Parse multi-role messages:                              │
+│      ```system``` ... ```user``` ... ```assistant```         │
+│                                                              │
+│ 3. Build Available Actions Menu                              │
+│    → Display in Quick Actions                                │
+│    → Sorted by priority                                      │
+└─────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ PHASE 2: Context Building                                   │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│ CustomActionContextBuilder.fromDocument()                    │
+│                                                              │
+│ Collects Rich Context:                                       │
+│   {                                                          │
+│     // Editor Context                                        │
+│     filepath: "/src/api/users.ts",                           │
+│     language: "typescript",                                  │
+│     selection: "User management API",                        │
+│                                                              │
+│     // Cursor Context                                        │
+│     beforeCursor: "const api = {",                           │
+│     afterCursor: "};\nexport default api;",                  │
+│                                                              │
+│     // Element Context (AST)                                 │
+│     element: {                                               │
+│       name: "UserAPI",                                       │
+│       type: "class",                                         │
+│       range: {...}                                           │
+│     },                                                       │
+│                                                              │
+│     // Toolchain Context                                     │
+│     frameworkContext: "React + TypeScript",                  │
+│     buildTool: "Vite",                                       │
+│     packageManager: "npm"                                    │
+│   }                                                          │
+└─────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ PHASE 3: Template Rendering                                 │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│ For Each Message in prompt.messages:                         │
+│                                                              │
+│ Message 1 (system):                                          │
+│   Template: "You are an expert API client developer..."      │
+│   Rendered: (no variables in this message)                   │
+│   Result: Same text                                          │
+│                                                              │
+│ Message 2 (user):                                            │
+│   Template: "Create client for: ${context.selection}"        │
+│   Rendered with Velocity:                                    │
+│     ${context.selection} → "User management API"             │
+│     ${context.language} → "typescript"                       │
+│     ${context.filepath} → "/src/api/users.ts"                │
+│   Result: "Create an API client for: User management API..." │
+│                                                              │
+│ Output: IChatMessage[]                                       │
+│   [{                                                         │
+│     role: ChatMessageRole.System,                            │
+│     content: "You are an expert..."                          │
+│   }, {                                                       │
+│     role: ChatMessageRole.User,                              │
+│     content: "Create an API client for: User management..."  │
+│   }]                                                         │
+└─────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ PHASE 4: LLM Execution                                       │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│ LanguageModelsService.chat(messages)                         │
+│                                                              │
+│ Multi-role conversation sent to LLM                          │
+│                                                              │
+│ LLM Response:                                                │
+│   ```typescript                                              │
+│   class UserAPIClient {                                      │
+│     async getUsers(): Promise<User[]> {                      │
+│       return fetch('/api/users').then(r => r.json());        │
+│     }                                                        │
+│     async createUser(user: User): Promise<User> {            │
+│       return fetch('/api/users', {                           │
+│         method: 'POST',                                      │
+│         body: JSON.stringify(user)                           │
+│       }).then(r => r.json());                                │
+│     }                                                        │
+│   }                                                          │
+│   ```                                                        │
+└─────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ PHASE 5: Output Routing Based on InteractionType            │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│ Switch (prompt.interaction):                                 │
+│                                                              │
+│   Case ChatPanel:                                            │
+│     → newChatSession(output)                                 │
+│     → Show in chat sidebar                                   │
+│                                                              │
+│   Case AppendCursor:                                         │
+│     → insertText(editor, output)                             │
+│     → Insert at cursor position                              │
+│                                                              │
+│   Case AppendCursorStream:                                   │
+│     → Stream output to cursor                                │
+│     → Real-time insertion                                    │
+│                                                              │
+│   Case OutputFile:                                           │
+│     → new FileGenerateTask(output)                           │
+│     → Parse file path from output                            │
+│     → Create new file                                        │
+│                                                              │
+│   Case ReplaceSelection:                                     │
+│     → updateText(editor, selection, output)                  │
+│     → Replace selected text                                  │
+│                                                              │
+│ Our Example: AppendCursorStream                              │
+│   → Code appears at cursor in real-time                      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Data Flow Diagram
+
+```
+Custom .vm File
+      │
+      ▼
+┌──────────────────────┐
+│ Parse Frontmatter    │
+│ Parse Role Messages  │
+└────────┬─────────────┘
+         │
+         ▼
+┌──────────────────────┐
+│ Build Context        │
+│ - Editor state       │
+│ - AST element        │
+│ - Toolchain          │
+└────────┬─────────────┘
+         │
+         ▼
+┌──────────────────────┐
+│ Render Each Message  │
+│ with Velocity        │
+└────────┬─────────────┘
+         │
+         ▼
+   IChatMessage[]
+         │
+         ▼
+┌──────────────────────┐
+│ LLM Call             │
+└────────┬─────────────┘
+         │
+         ▼
+    Output Text
+         │
+         ▼
+┌──────────────────────────────────┐
+│ Route Based on InteractionType: │
+│ ┌────────┬──────────────────┐   │
+│ │ Chat   │ Cursor │ File   │   │
+│ └────────┴────────┴────────┘   │
+└──────────────────────────────────┘
+```
+
+### Context Variables Available
+
+- `${context.filepath}` - Current file path
+- `${context.language}` - Programming language
+- `${context.selection}` - Selected text
+- `${context.beforeCursor}` - Text before cursor
+- `${context.afterCursor}` - Text after cursor
+- `${context.element}` - Current AST element (class/function)
+- `${context.frameworkContext}` - Detected framework
+- `${context.buildTool}` - Build tool (npm, gradle, etc.)
+
+---
+
+## Refactoring Pipelines
+
+## 5. Rename Suggestion Pipeline
+
+**Purpose:** Suggest better names for variables, functions, classes based on context.
+
+**Executor:** `RenameLookupExecutor`
+**Location:** `/src/action/refactor/rename/RenameLookupExecutor.ts`
+
+**Total Steps:** 1 LLM call
+**Pattern:** Single + Context
+
+### Flow Diagram (ASCII)
+
+```
+User Action: F2 on Symbol
+       │
+       ▼
+┌─────────────────────┐
+│ Extract Context     │
+│ - originName        │
+│ - surrounding code  │
+└──────┬──────────────┘
+       │
+       ▼
+┌─────────────────────┐
+│ Render rename.vm    │
+└──────┬──────────────┘
+       │
+       ▼
+┌─────────────────────┐
+│ LLM suggests name   │
+└──────┬──────────────┘
+       │
+       ▼
+┌─────────────────────┐
+│ postNameFix()       │
+│ - Remove quotes     │
+└──────┬──────────────┘
+       │
+       ▼
+  Better Name
+       │
+       ▼
+┌─────────────────────┐
+│ Show in Rename UI   │
+│ (as placeholder)    │
+└─────────────────────┘
+```
+
+---
+
+## 6. Commit Message Generation Pipeline
+
+**Purpose:** Generate conventional commit messages from git diffs.
+
+**Executor:** `CommitMessageGenAction`
+**Location:** `/src/action/devops/CommitMessageGenAction.ts`
+
+**Flow Diagram (ASCII):**
+
+```
+User Command: Generate Commit
+       │
+       ▼
+┌──────────────────────┐
+│ Get Active Repo      │
+│ Read Git Diff        │
+└──────┬───────────────┘
+       │
+       ▼
+┌──────────────────────┐
+│ Build Context:       │
+│ - diffContent        │
+│ - historyExamples    │
+└──────┬───────────────┘
+       │
+       ▼
+┌──────────────────────┐
+│ Render template:     │
+│ gen-commit-msg.vm    │
+└──────┬───────────────┘
+       │
+       ▼
+┌──────────────────────┐
+│ LLM generates msg:   │
+│ "feat(api): add user │
+│  authentication"     │
+└──────┬───────────────┘
+       │
+       ▼
+┌──────────────────────┐
+│ Set in Git Input Box │
+└──────────────────────┘
+```
+
+---
+
+## 7. LLM Reranker Pipeline
+
+**Purpose:** Rerank search results using LLM relevance judgments.
+
+**Executor:** `LLMReranker`
+**Location:** `/src/code-search/reranker/LlmReranker.ts`
+
+**Total Steps:** N LLM calls (one per chunk)
+**Pattern:** Iterative Parallel
+
+### Flow Diagram (ASCII)
+
+```
+Query + ChunkItem[]
+       │
+       ▼
+┌────────────────────────────────────────────┐
+│ For Each Chunk (in parallel):              │
+│                                            │
+│  ┌────────────────┐  ┌────────────────┐   │
+│  │ Chunk 1        │  │ Chunk 2        │   │
+│  │ ↓              │  │ ↓              │   │
+│  │ Context:       │  │ Context:       │   │
+│  │  - query       │  │  - query       │   │
+│  │  - documentId  │  │  - documentId  │   │
+│  │  - document    │  │  - document    │   │
+│  │ ↓              │  │ ↓              │   │
+│  │ llm-reranker.vm│  │ llm-reranker.vm│   │
+│  │ ↓              │  │ ↓              │   │
+│  │ LLM Call #1    │  │ LLM Call #2    │   │
+│  │ ↓              │  │ ↓              │   │
+│  │ "yes" → 1.0    │  │ "no" → 0.0     │   │
+│  └────────────────┘  └────────────────┘   │
+│           │                   │            │
+│           └─────────┬─────────┘            │
+│                     ▼                      │
+│              scores: [1.0, 0.0, ...]       │
+└────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────┐
+│ Return Scores[]     │
+│ for reranking       │
+└─────────────────────┘
+```
+
+### Key Characteristics
+
+- **Parallel Execution:** All chunks scored simultaneously
+- **Binary Classification:** Yes (1.0) or No (0.0)
+- **Few-Shot Examples:** Prompt includes examples for consistency
+- **Fast Model:** Uses lightweight model for speed
+
+---
+
+## Pipeline Comparison Table
+
+| Pipeline | Type | LLM Calls | Streaming | Avg Time | Prompts | Input | Output |
+|----------|------|-----------|-----------|----------|---------|-------|--------|
+| **HyDE Code** | Sequential | 2 | No | 5-8s | propose.vm, evaluate.vm | Query | Answer + Chunks |
+| **HyDE Keywords** | Sequential | 2 | No | 5-8s | propose.vm, evaluate.vm | Query | Answer + Chunks |
+| **Auto Doc** | Single + Context | 1 | No | 2-4s | auto-doc.vm | Code Element | Documentation |
+| **Auto Test** | Single + Context | 1 | Yes | 5-10s | test-gen.vm | Code Element | Test File |
+| **Auto Method** | Single + Context | 1 | No | 3-5s | auto-method.vm | Signature | Implementation |
+| **Custom Action** | Multi-Role | 1 | Optional | 2-6s | User-defined | Context | Variable |
+| **Rename** | Single | 1 | No | 1-2s | rename.vm | Symbol | Name |
+| **Commit Msg** | Single + Context | 1 | No | 2-3s | gen-commit-msg.vm | Git Diff | Commit Message |
+| **LLM Reranker** | Iterative | N | No | 1-3s | llm-reranker.vm | Query + Chunks | Scores[] |
+
+---
+
+## Common Patterns Summary
+
+### 1. Context Collection Pattern
+
+**Used by:** Almost all pipelines
+
+```
+Action Triggered
+       │
+       ▼
+┌──────────────────────────────────────┐
+│ ToolchainContextManager              │
+│ .collectToolchain()                  │
+│                                      │
+│ Parallel Collection:                 │
+│  ┌─────────────────────────────┐    │
+│  │ Build Tool Provider         │    │
+│  │ → package.json, build.gradle│    │
+│  └─────────────────────────────┘    │
+│  ┌─────────────────────────────┐    │
+│  │ Framework Provider          │    │
+│  │ → React, Spring, etc.       │    │
+│  └─────────────────────────────┘    │
+│  ┌─────────────────────────────┐    │
+│  │ Structure Provider          │    │
+│  │ → Project structure         │    │
+│  └─────────────────────────────┘    │
+│                                      │
+│ Output: ToolchainContextItem[]       │
+└──────────────────────────────────────┘
+       │
+       ▼
+  context.chatContext
+```
+
+### 2. Template Rendering Pattern
+
+**Used by:** All pipelines
+
+```
+ActionType + TemplateContext
+       │
+       ▼
+┌──────────────────────────────────────┐
+│ PromptManager.generateInstruction()  │
+│                                      │
+│ 1. Select Language (en/zh-cn)       │
+│ 2. Load Template (.vm file)         │
+│ 3. Render with Velocity              │
+│    - Variables: ${context.var}       │
+│    - Conditionals: #if/$end          │
+│    - Loops: #foreach/#end            │
+│                                      │
+│ Output: Rendered Prompt String       │
+└──────────────────────────────────────┘
+```
+
+### 3. Streaming Response Pattern
+
+**Used by:** Auto Test, Custom Actions (optional)
+
+```
+LLM Streaming Call
+       │
+       ▼
+┌─────────────────────────────────────┐
+│ LanguageModelsService.chat(         │
+│   messages,                         │
+│   options,                          │
+│   {                                 │
+│     report: (fragment) => {         │
+│       output += fragment.part       │
+│       ┌──────────────────────────┐  │
+│       │ Parse Partial Code       │  │
+│       │ Update UI Immediately    │  │
+│       └──────────────────────────┘  │
+│     }                               │
+│   }                                 │
+│ )                                   │
+└─────────────────────────────────────┘
+       │
+       ▼
+  Real-time Updates
+```
+
+---
+
+## Request Lifecycle Example
+
+**Full lifecycle of "Generate Tests for Calculator Class":**
+
+```
+T+0ms: User right-clicks → "AutoTest for method"
+       │
+T+10ms: AutoTestActionCreator.buildMethodAction()
+       → vscode.CodeAction created
+       │
+T+20ms: CommandsService.generateUnitTest()
+       → Parse AST → NamedElement
+       │
+T+50ms: AutoTestActionExecutor initialized
+       │
+T+100ms: Test Environment Setup
+       → Detect Jest framework
+       → Create tests/Calculator.test.ts path
+       │
+T+200ms: Context Collection (Parallel)
+       ┌─────────────────────┬─────────────────────┐
+       │ Parse AST           │ Find Related Classes│
+       │ 50ms                │ 80ms                │
+       └─────────────────────┴─────────────────────┘
+       ┌─────────────────────┬─────────────────────┐
+       │ Toolchain Context   │ Test Samples        │
+       │ 60ms                │ 10ms                │
+       └─────────────────────┴─────────────────────┘
+       │
+T+300ms: Template Rendering
+       → Load test-gen.vm
+       → Render with Velocity
+       → Full prompt ready
+       │
+T+350ms: Open test file in editor
+       │
+T+400ms: Start LLM Streaming Call
+       │
+T+600ms: First fragment received
+       → "describe('Calculator', () => {"
+       → Update file immediately
+       │
+T+800ms: More fragments...
+       → Tests appearing line by line
+       │
+T+5000ms: Final fragment received
+       → Complete test file
+       │
+T+5050ms: Post-processing
+       → Fix imports
+       → Format code
+       │
+T+5100ms: Validation
+       → File not empty ✓
+       │
+T+5150ms: StatusBar → "Done"
+       │
+User sees complete tests and can edit/run
+```
+
+---
+
+## Performance Characteristics
+
+### Latency Breakdown
+
+**Single LLM Call Pipeline (e.g., Auto Doc):**
+```
+Context Collection: 50-200ms
+Template Rendering: 10-30ms
+LLM Call:          1500-3000ms
+Post-Processing:   20-100ms
+─────────────────────────────────
+Total:             1.6-3.3s
+```
+
+**Sequential Multi-LLM Pipeline (e.g., HyDE):**
+```
+Propose Phase:
+  Rendering:       10-30ms
+  LLM Call #1:     1500-3000ms
+Retrieval:         200-500ms
+Evaluate Phase:
+  Rendering:       10-30ms
+  LLM Call #2:     1500-3000ms
+─────────────────────────────────
+Total:             3.2-6.6s
+```
+
+**Streaming Pipeline (e.g., Auto Test):**
+```
+Setup + Context:   100-300ms
+Template:          10-30ms
+First Fragment:    500-1000ms (TTFB)
+Streaming:         3000-8000ms
+Post-Process:      50-150ms
+─────────────────────────────────
+Total:             3.7-9.5s
+User sees output starting at 600ms-1.3s
+```
+
+### Optimization Strategies
+
+1. **Parallel Context Collection**
+   - Multiple providers execute concurrently
+   - Reduces context gathering from ~500ms to ~200ms
+
+2. **Template Caching**
+   - Templates cached in memory after first load
+   - Subsequent renders: <5ms
+
+3. **Streaming for Long Outputs**
+   - Progressive rendering reduces perceived latency
+   - User sees output 3-5x faster
+
+4. **Retrieval Caching**
+   - Code chunk embeddings cached
+   - Repeat searches: 10x faster
+
+---
+
+## Extension Points
+
+### Adding Custom Pipelines
+
+**1. Create Custom Prompt:**
+```velocity
+.autodev/prompts/my-action.vm:
+---
+name: "My Custom Action"
+interaction: AppendCursorStream
+priority: 1
+---
+```system```
+You are a ${context.language} expert.
+
+```user```
+${context.selection}
+```
+
+**2. Restart Extension** - Prompt auto-discovered
+
+**3. Access via Quick Actions** - Available in menu
+
+### Adding Toolchain Providers
+
+**Interface:**
+```typescript
+interface IToolchainContextProvider {
+  isApplicable(context: ToolchainContext): boolean;
+  collect(context: ToolchainContext): Promise<ToolchainContextItem[]>;
+}
+```
+
+**Example:**
+```typescript
+class MyFrameworkProvider implements IToolchainContextProvider {
+  isApplicable(ctx: ToolchainContext): boolean {
+    return ctx.filename.includes('my-framework');
+  }
+
+  async collect(ctx: ToolchainContext): Promise<ToolchainContextItem[]> {
+    return [{
+      name: "Framework Config",
+      text: "Using MyFramework v2.0"
+    }];
+  }
+}
+```
+
+---
+
+## Conclusion
+
+AutoDev implements a sophisticated multi-pipeline agent architecture that handles diverse developer workflows through:
+
+- **10 Major Pipelines** ranging from simple to complex
+- **3 Core Patterns:** Sequential, Single+Context, Iterative
+- **Rich Context** from toolchain, AST, and code analysis
+- **Flexible Templates** with Velocity rendering
+- **Streaming Support** for real-time feedback
+- **Extensibility** via custom prompts and providers
+
+The combination of these patterns enables AutoDev to provide intelligent, context-aware assistance across the entire development lifecycle.
